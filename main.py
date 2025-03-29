@@ -1,25 +1,17 @@
-import asyncio
 import json
+import logging
 import os
-import re
-import whois
+from collections import deque
 import pandas as pd
-from playwright.async_api import async_playwright
+from playwright.sync_api import sync_playwright
 from bs4 import BeautifulSoup
 from urllib.parse import urlparse, urljoin
 import tldextract
-import requests
+import openai
+from time import sleep
 
 
-def format_web_to_open_ai(web_scrape_content: str) -> dict:
-    """ Gets the web content and return dict with:
-    1. icon_url
-    2. matadata
-    3. formatted content (no html tags, no css)
-    4.
-    """
-    pass
-
+openai.api_key = "YOUR_OPENAI_API_KEY"  # FROM .ENV!
 
 MIN_SCORE = 12
 
@@ -110,46 +102,36 @@ SAAS_DICT_DETECTION = {word.lower(): HIGH_SCORE for word in HIGH_SAAS_WORDS}
 SAAS_DICT_DETECTION.update({word.lower(): MEDIUM_SCORE for word in MEDIUM_SAAS_WORDS})
 SAAS_DICT_DETECTION.update({word.lower(): LOW_SCORE for word in LOW_SAAS_WORDS})
 
+EXTERNAL_SOURCES = [
+    "https://www.linkedin.com/search/results/companies/?keywords={query}",
+    "https://en.wikipedia.org/wiki/{query}",
+    "https://twitter.com/search?q={query}&src=typed_query"
+]
 
-def get_page_info_from_gpt(web_text, metadata) -> tuple[str]:
+
+def clean_hostname_for_query(hostname: str) -> str:
     """
-    - System name
-    - Vendor name
-    - System Description
+    Extracts a clean query string from a hostname.
+    Removes subdomains like 'www' or 'accounts' and TLDs like '.com'.
+
+    Example: 'www.openai.com' -> 'openai'
     """
-    pass
+    ext = tldextract.extract(hostname)
+    return ext.domain  # e.g., 'openai' from 'www.openai.com'
 
 
-def get_description(soup) -> str:
-    desc_tag = (
-            soup.find("meta", attrs={"name": "description"}) or
-            soup.find("meta", attrs={"property": "og:description"})
-    )
-    return desc_tag["content"].strip() if desc_tag and "content" in desc_tag.attrs else ""
-
-def extract_vendor_from_whois(domain: str) -> str | None:
-    try:
-        w = whois.whois(domain)
-        return w.get("org") or w.get("name")
-    except Exception:
-        return None
-
-
-def extract_vendor_from_footer(html: str) -> str | None:
-    soup = BeautifulSoup(html, "html.parser")
-    footers = soup.find_all("footer")
-
-    extra_candidates = soup.find_all(string=re.compile(r"©|\(c\)|Copyright", re.I))
-    all_candidates = footers + [tag.parent for tag in extra_candidates if tag.parent]
-
-    for tag in all_candidates:
-        text = tag.get_text(" ", strip=True)
-        match = re.search(r"(?:©|\(c\)|Copyright)\s*\d{0,4}\s*(.*?)\s*(All rights reserved|\.|$)", text, re.I)
-        if match:
-            return match.group(1).strip()
-
-    return None
-
+def get_best_external_source_text(hostname: str) -> str:
+    """
+    Searches external sources (LinkedIn, Wikipedia, Twitter) using Playwright
+    and extracts visible text that can help determine if the product uses AI.
+    """
+    query = clean_hostname_for_query(hostname)
+    for template in EXTERNAL_SOURCES:
+         url = template.format(query=query)
+         web_text, _ = scrape_page(url)
+    # todo need to complete logic of determine best sourc with ai data, best will be linked in later wiki... todo
+    # todo check if working
+    return ""
 
 def find_about_page_url(soup: BeautifulSoup, base_url: str) -> str | None:
     for a in soup.find_all("a", href=True):
@@ -160,110 +142,126 @@ def find_about_page_url(soup: BeautifulSoup, base_url: str) -> str | None:
     return None
 
 
-def extract_vendor_from_about_page(about_url: str) -> str | None:
+
+def get_favicon_url(url: str) -> str:
+    """
+    Given a URL, return the full favicon URL from the site.
+    Supports JavaScript-rendered pages (uses Playwright).
+    """
     try:
-        res = requests.get(about_url, timeout=10)
-        if res.status_code != 200:
-            return None
-        soup = BeautifulSoup(res.text, "html.parser")
+        with sync_playwright() as p:
+            browser = p.chromium.launch(headless=True)
+            context = browser.new_context()
+            page = context.new_page()
+            page.goto(url, wait_until="networkidle")
+            page.wait_for_timeout(2000)  # Let JS settle
 
-        # Try first heading or first paragraph
-        heading = soup.find(["h1", "h2", "h3"])
-        if heading:
-            return heading.get_text(strip=True)
+            # Get favicon via JS DOM access
+            favicon_href = page.evaluate("""
+                () => {
+                    const rels = ["icon", "shortcut icon", "apple-touch-icon"];
+                    for (const rel of rels) {
+                        const link = document.querySelector(`link[rel='${rel}']`);
+                        if (link && link.href) return link.href;
+                    }
+                    return "/favicon.ico";  // fallback
+                }
+            """)
+            browser.close()
+            return urljoin(url, favicon_href)
 
-        paragraph = soup.find("p")
-        if paragraph:
-            return paragraph.get_text(strip=True)
-
-    except Exception:
-        return None
-
-
-def get_vendor_name(html: str, base_url: str) -> str | None:
-    soup = BeautifulSoup(html, "html.parser")
-
-    # 1. Try footer
-    name = extract_vendor_from_footer(html)
-    if name:
-        return name
-
-    # 2. Try WHOIS org name
-    domain = tldextract.extract(base_url).registered_domain
-    if domain:
-        name = extract_vendor_from_whois(domain)
-        if name:
-            return name
-
-    # 3. Try "About" page
-    about_url = find_about_page_url(soup, base_url)
-    if about_url:
-        name = extract_vendor_from_about_page(about_url)
-        if name:
-            return name
+    except Exception as e:
+        print(f"Error extracting favicon from {url}: {e}")
+        return ""
 
 
-    return ""
 
-def get_favicon_url(soup, base_url):
-    # Priority: SVG > PNG > ICO
-    rels = ["apple-touch-icon", "icon", "shortcut icon"]
+def get_page_info_from_gpt(web_text: str) -> tuple[bool, str, str, str]:
+    """
+    Use GPT to analyze scraped text and extract:
+    - system name (product)
+    - vendor name (company)
+    - short description
+    Also confirm if it's actually a SaaS product (vs. blog/docs).
+    """
+    prompt = f"""
+You are an AI assistant helping to classify if website give ai usage to consumer. Based on the following web page text, answer the following questions clearly and briefly.
 
-    for rel in rels:
-        icon_tag = soup.find("link", rel=rel)
-        if icon_tag and "href" in icon_tag.attrs:
-            href = icon_tag["href"]
-            if any(href.endswith(ext) for ext in [".svg", ".png", ".ico"]):
-                return urljoin(base_url, href)
-    parsed = urlparse(base_url)
-    return f"{parsed.scheme}://{parsed.netloc}/favicon.ico"
+TEXT:
+--
+{web_text} 
+--
+
+Questions:
+1. Is this page describing a real Ai SaaS product?
+2. What is the name of the product or system?
+3. Who is the vendor or company behind it?
+4. Write a concise description of what the system does.
+
+Respond in the following JSON format:
+{{
+  "is_ai": bool,
+  "system_name": "string",
+  "vendor_name": "string",
+  "description": "string"
+}}
+"""
+
+    try:
+        response = openai.ChatCompletion.create(
+            model="gpt-3.5-turbo",
+            messages=[{"role": "user", "content": prompt}],
+            temperature=0.4,
+        )
+
+        content = response["choices"][0]["message"]["content"]
+
+        import json
+        result = json.loads(content)
+
+        return (
+            result.get("is_ai", "").strip(),
+            result.get("system_name", "").strip(),
+            result.get("vendor_name", "").strip(),
+            result.get("description", "").strip()
+        )
+
+    except Exception as e:
+        print(f"Error getting GPT response: {e}")
+        return False, "", "", ""
 
 
-async def get_internal_subpages(soup, base_url, hostname, max_pages=5) -> list[str]:
-    subpages = set()
-    for a in soup.find_all("a", href=True):
-        href = a["href"]
-        # Ignore external links and fragments
-        if href.startswith("#") or "mailto:" in href or "tel:" in href:
-            continue
-        if href.startswith("/") and hostname in href:
-            subpages.add(urljoin(base_url, href))
-        # Limit the number of pages to check - Optional
-        # if len(subpages) >= max_pages:
-        #     break
-    return list(subpages)
+def get_ai_score(web_text) -> tuple[bool, int]:
+    """
+    Check if the text likely describes an AI-related product.
 
-def is_contain_ai_words(web_text) -> bool:
+    Returns True and the score if AI-related keywords exceed MIN_SCORE.
+
+    Args:
+        web_text (str): Text content from a web page.
+
+    Returns:
+        tuple[bool, int]: (is_ai, score)
+    """
     score = 0
-    print("start ai check")
     web_text = web_text.lower().replace("-", "").replace("\n", " ").split()
 
     for word in web_text:
         if word in AI_DICT_DETECTION:
             score += AI_DICT_DETECTION[word]
-            print(f'{score} ai points for word {word}')
         if score > MIN_SCORE:
-            return True
-    return False
-
-
-def is_page_contain_ai(web_text: str) -> bool:
-    """
-    1. search by words
-    2. send to open ai just web's text (short prompt)  # todo
-    """
-    return is_contain_ai_words(web_text)  # temp
+            return True, score
+    return False, 0
 
 
 def is_contain_saas_words(web_text) -> bool:
     score = 0
-    print("start saas check")
     text = web_text.lower().replace("-", "").replace("\n", " ").split()
     for word in SAAS_DICT_DETECTION:
         if word in text:
             score += SAAS_DICT_DETECTION[word]
-            print(f'{score} saas points for word {word}')
         if score > MIN_SCORE:
+            print(f'saas ford has been found in main page: {word}')
             return True
     return False
 
@@ -278,137 +276,179 @@ def is_web_saas(web_text) -> bool:
     return is_contain_saas_words(web_text)
 
 
-def extract_metadata(soup: BeautifulSoup) -> dict:
-    metadata = {}
-    # Page title
-    if soup.title:
-        metadata["title"] = soup.title.string.strip()
-    # Meta description
-    description_tag = soup.find("meta", attrs={"name": "description"})
-    if description_tag and description_tag.get("content"):
-        metadata["description"] = description_tag["content"].strip()
-    # Open Graph tags (og:title, og:description, etc.)
-    og_tags = ["og:title", "og:description", "og:site_name"]
-    for tag in og_tags:
-        og_tag = soup.find("meta", property=tag)
-        if og_tag and og_tag.get("content"):
-            metadata[tag] = og_tag["content"].strip()
-
-    return metadata
+def is_same_domain(url: str, base: str) -> bool:
+    """Check if `url` belongs to the same hostname/domain as `base`."""
+    return urlparse(url).netloc == urlparse(base).netloc
 
 
-async def scrape_url_info(hostname: str) -> dict:
+def get_all_sub_pages_data(root_url: str, max_pages: int = 30) -> list[dict]:
     """
-    1. Check if web is SaaS
-    2. Find if there is AI usage on the homepage
-    3. If not, check a few internal subpages
+    Crawl subpages from a root URL (using BFS), collect text, and detect AI-related content.
+
+    Args:
+        root_url (str): The full starting URL (e.g., "https://example.com").
+        max_pages (int): Maximum number of pages to visit during the crawl.
+
+    Returns:
+        List[dict]: A list of dictionaries for each page containing:
+            - "url" (str): The page URL.
+            - "web_text" (str): The visible text content of the page.
+            - "ai_score" (float): The AI content score if detected.
     """
+    visited = set()
+    to_visit = deque([root_url])
+    results = []
+
+    while to_visit and len(visited) < max_pages:
+        current_url = to_visit.popleft()
+
+        if current_url in visited:  # should never get in but for extra safety...
+            continue
+
+        logging.info(f"Crawling: {current_url}")
+        web_text, links = scrape_page(current_url)
+
+        visited.add(current_url)
+
+        to_visit += [link for link in links if link not in visited and is_same_domain(link, root_url)]
+
+        if not web_text:
+            continue
+
+        is_ai_and_score = get_ai_score(web_text)
+        if is_ai_and_score[0]:
+            results.append(
+                {
+                    "web_text": web_text,
+                    "url": current_url,
+                    "ai_score": is_ai_and_score[1]
+                }
+            )
+
+    return results
+
+
+def fix_url(hostname: str) -> str:
+    """
+    Apply any necessary URL corrections before scraping.
+    Extend this function as needed.
+    """
+    url = f'https://{tldextract.extract(hostname).registered_domain}/'
+    url = url.replace('.net', '.com')
+    # Add more rules here if needed
+    return url
+
+
+def scrape_page(hostname: str) -> tuple[str, list[str]]:
+    """
+    Scrape the given URL using a headless browser.
+
+    Returns:
+        - The full visible text content of the page.
+        - A list of all absolute HTTP/HTTPS links found in <a> tags.
+    """
+    logging.info(f"Starting scrape: {hostname}")
+    if not hostname.startswith('http'): # in case valid url entered (case scrape subpages or external sorces)
+        url = fix_url(hostname)
+        logging.debug(f"Fixed URL: {url}")
+    else:
+        url = hostname
+
+    try:
+        with sync_playwright() as p:
+            browser = p.chromium.launch(headless=True)
+            page = browser.new_page()
+
+            page.goto(url, wait_until="networkidle")
+            logging.info(f"Page loaded: {url}")
+
+            # Get all hrefs from <a> tags
+            hrefs = page.eval_on_selector_all("a", "els => els.map(el => el.href)")
+            links = [href for href in hrefs if href and href.startswith("http") and hostname in href]
+            logging.info(f"Found {len(links)} links")
+
+            # Get all visible text content
+            web_text = page.evaluate("() => document.body.innerText")
+
+            browser.close()
+            return web_text, links
+
+    except Exception as e:
+        logging.error(f"Failed to scrape {url}: {e}")
+        return "", []
+
+
+def get_hostname_dict_data(hostname: str) -> dict:
+    """
+    """
+    homepage_url = fix_url(hostname)
+
     result = {
         "hostname": hostname,
-        "is_SaaS": False,
+        "vendor_website_url": homepage_url, # fixed homepage url
         "is_ai": False,
-        "vendor_website_url": "",
-        "system_name": "", # Product name
         "description": "",
+        "system_name": "", # Product name
         "vendor_name": "",  # Company name
         "favicon_url": "",
     }
 
-    url = f'https://{tldextract.extract(hostname).registered_domain}/'
-    url = url.replace('.net', '.com')
+    web_text, _ = scrape_page(homepage_url)
 
-    async with async_playwright() as p:
-        browser = await p.chromium.launch(headless=True)
-        context = await browser.new_context()
-        page = await context.new_page()
+    is_saas = is_web_saas(web_text)
+    has_ai_probability = get_ai_score(web_text)[0]
 
-        try:
-            await page.goto(url, timeout=60000)
-            await page.wait_for_timeout(5000)
-
-            text = await page.evaluate("() => document.body.innerText")
-            html = await page.content()
-            soup = BeautifulSoup(html, "html.parser")
-
-            # Check SaaS
-            if not is_web_saas(text):
-                result['is_SaaS'] = False
-                return result
-            result['is_SaaS'] = True
-
-            # Check first for homepage. if not found - scrape all sub-pages
-            is_current_page_have_ai = is_page_contain_ai(text)
-            if is_current_page_have_ai:
-                result['vendor_website_url'] = url
+    if not has_ai_probability:
+        sub_pages_data = get_all_sub_pages_data(homepage_url, 10)
+        if sub_pages_data:
+            has_ai_probability = True
+            #  search for about page, else for highest ai score
+            about_page = next((p for p in sub_pages_data if "about" in p.get("url", "").lower()), None)
+            if about_page:
+                web_text = about_page.get("web_text", "")
             else:
-                subpage_urls = await get_internal_subpages(soup, url, hostname)
-                for subpage_url in subpage_urls:
-                    try:
-                        subpage = await context.new_page() # open new page for not loose the first page content
-                        await subpage.goto(subpage_url, timeout=30000)
-                        await subpage.wait_for_timeout(2000)
-                        sub_text = await subpage.evaluate("() => document.body.innerText")
-                        await subpage.close()
+                sub_pages_data.sort(key=lambda x: x.get("ai_score", 0), reverse=True)
+                web_text = sub_pages_data[0].get('web_text')  # gets the web with the highest ai score and will ask for him in prompt
 
-                        if is_page_contain_ai(sub_text):
-                            is_current_page_have_ai = True
-                            sub_html = await subpage.content()
-                            sub_text = await subpage.evaluate("() => document.body.innerText")
-                            sub_soup = BeautifulSoup(sub_html, "html.parser")
-                            result['vendor_website_url'] = subpage_url
-                            break
-                            # TODO take care if there is more than 1 ai subpage for this hostname
-                    except Exception as e:
-                        print(f"Failed to scrape subpage {subpage_url}: {e}")
-                        return result
+    if has_ai_probability:
+        is_ai, system_name, vendor_name, description = get_page_info_from_gpt(web_text)
+        result["is_ai"] = is_ai
+        result['favicon_url'] = get_favicon_url(homepage_url)
+        result['system_name'] = system_name
+        result['vendor_name'] = vendor_name
+        result['description'] = description
+        return result
 
-                if not is_current_page_have_ai:
-                    return result
+    if is_saas:
+        best_external_web_text = get_best_external_source_text(hostname)
+        if best_external_web_text:
+            system_name, vendor_name, description, is_ai = get_page_info_from_gpt(best_external_web_text)
+            result["is_ai"] = is_ai
+            result['favicon_url'] = get_favicon_url(homepage_url)
+            result["system_name"] = system_name
+            result["vendor_name"] = vendor_name
+            result["description"] = description
 
-            result['is_ai'] = True
-            # todo need to decide it to search on sub page or homepage
-
-            # option 1: all once from openai and if needed external sources
-
-            metadata = extract_metadata(soup)
-            # system_name, vendor_name, description = get_page_info_from_gpt(text, metadata)
-
-            # option 2: all free, no prompt - danger might not have the true details or missing some
-
-            result['system_name'] = soup.title.string.strip() if soup.title else ""
-            # result['vendor_name'] = get_vendor_name(html, url) # fixme
-            result['description'] = get_description(soup) # or sub_soup?
-            result['favicon_url'] = get_favicon_url(soup, url)
-
-            return result
-
-        except Exception as e:
-            print(f"Error scraping {url}: {e}")
-            return result
-        finally:
-            await browser.close()
+    return result
 
 
-async def main():
+def main():
     input_file = "corona_pending_hostnames.json"
-    output_file = "enriched_data.xlsx"  # Changed to .xlsx
+    output_file = "enriched_data.xlsx"
 
-    # Ensure input JSON exists
     if not os.path.exists(input_file):
         print(f"❌ File not found: {input_file}")
         return
 
-    # Load hostnames
     with open(input_file, "r", encoding="utf-8") as f:
         hostnames = json.load(f)
 
-    # Filter non-empty and limit for testing
-    hostnames = [url for url in hostnames if url][:2]
+    hostnames = [url for url in hostnames if url][:30]
 
     results = []
     for i, hostname in enumerate(hostnames):
         print(f"{i + 1}. Processing: {hostname}")
-        result = await scrape_url_info(hostname)
+        result = get_hostname_dict_data(hostname)
         results.append(result)
 
     # Save to Excel (creates if not exists, overwrites if exists)
@@ -418,4 +458,4 @@ async def main():
 
 
 if __name__ == "__main__":
-    asyncio.run(main())
+    main()  # can add async version if test lot of hostnames
