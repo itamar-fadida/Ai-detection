@@ -1,0 +1,15 @@
+__pycache__/
+*.pyc
+.env
+.venv/
+env/
+venv/
+*.log
+*.csv
+*.xlsx
+*.sqlite3
+.DS_Store
+corona_pending_hostnames.json
+.vscode/
+.idea/
+tmp/
