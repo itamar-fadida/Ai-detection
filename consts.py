@@ -74,7 +74,7 @@ AI_DICT_DETECTION.update({word.lower(): LOW_SCORE for word in LOW_AI_WORDS})
 
 HIGH_SAAS_WORDS = {
     "dashboard", "subscription", "cloud-based", "platform", "software as a service", "web app", "multi-tenant", "saas",
-    "login", "sign up", "pricing", "api", "register", "account", "demo", "online software", "free trial",
+    "login", "log in", "sign up", "pricing", "api", "register", "account", "demo", "online software", "free trial",
 }
 MEDIUM_SAAS_WORDS = {
      "users", "plans", "admin panel",

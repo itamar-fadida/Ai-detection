@@ -8,13 +8,9 @@ from bs4 import BeautifulSoup
 from urllib.parse import urlparse, urljoin
 import tldextract
 import openai
-
-
 from dotenv import load_dotenv
-
 from consts import EXTERNAL_SOURCES, AI_DICT_DETECTION, MIN_SCORE, SAAS_DICT_DETECTION
 
-load_dotenv()
 
 openai.api_key = openai_api_key = os.getenv("OPEN_AI")
 
@@ -60,13 +56,10 @@ def get_favicon_url(url: str) -> str:
     """
     try:
         with sync_playwright() as p:
-            browser = p.chromium.launch(headless=True)
-            context = browser.new_context()
-            page = context.new_page()
-            page.goto(url, wait_until="networkidle")
-            page.wait_for_timeout(2000)  # Let JS settle
+            browser = p.chromium.launch(headless=False)
+            page = browser.new_page()
+            page.goto(url, wait_until="domcontentloaded")
 
-            # Get favicon via JS DOM access
             favicon_href = page.evaluate("""
                 () => {
                     const rels = ["icon", "shortcut icon", "apple-touch-icon"];
@@ -95,45 +88,46 @@ def get_page_info_from_gpt(web_text: str) -> tuple[bool, str, str, str]:
     Also confirm if it's actually a SaaS product (vs. blog/docs).
     """
     prompt = f"""
-You are an AI assistant helping to classify if website give ai usage to consumer. Based on the following web page text, answer the following questions clearly and briefly.
+    You are an AI classifier. Based on the text below, answer:
 
-TEXT:
---
-{web_text} 
---
+    1. Is this an AI SaaS product?
+    2. What is the product name?
+    3. Who is the vendor?
+    4. What does the system do? Write a description around 160 characters.
 
-Questions:
-1. Is this page describing a real Ai SaaS product?
-2. What is the name of the product or system?
-3. Who is the vendor or company behind it?
-4. Write a concise description of what the system does.
+    TEXT:
+    --
+    {web_text}
+    --
 
-Respond in the following JSON format:
-{{
-  "is_ai": bool,
-  "system_name": "string",
-  "vendor_name": "string",
-  "description": "string"
-}}
-"""
+    Respond in JSON:
+    {{
+      "is_ai": bool,
+      "system_name": "string",
+      "vendor_name": "string",
+      "description": "string"
+    }}
+    """
 
     try:
-        response = openai.ChatCompletion.create(
+        client = openai.OpenAI()  # Automatically uses OPENAI_API_KEY env var
+
+        response = client.chat.completions.create(
             model="gpt-3.5-turbo",
-            messages=[{"role": "user", "content": prompt}],
+            messages=[
+                {"role": "user", "content": prompt}
+            ],
             temperature=0.4,
         )
 
-        content = response["choices"][0]["message"]["content"]
-
-        import json
+        content = response.choices[0].message.content.strip()
         result = json.loads(content)
 
         return (
-            result.get("is_ai", "").strip(),
-            result.get("system_name", "").strip(),
-            result.get("vendor_name", "").strip(),
-            result.get("description", "").strip()
+            result.get("is_ai", False),
+            result.get("system_name", ""),
+            result.get("vendor_name", ""),
+            result.get("description", ""),
         )
 
     except Exception as e:
@@ -166,7 +160,7 @@ def get_ai_score(web_text) -> tuple[bool, int]:
 
 def is_contain_saas_words(web_text) -> bool:
     score = 0
-    text = web_text.lower().replace("-", "").replace("\n", " ").split()
+    text = web_text.lower().replace("-", "").replace("\n", " ")
     for word in SAAS_DICT_DETECTION:
         if word in text:
             score += SAAS_DICT_DETECTION[word]
@@ -249,7 +243,7 @@ def fix_url(hostname: str) -> str:
     return url
 
 
-def scrape_page(hostname: str) -> tuple[str, list[str]]:
+def scrape_page(url: str) -> tuple[str, list[str]]:
     """
     Scrape the given URL using a headless browser.
 
@@ -257,24 +251,22 @@ def scrape_page(hostname: str) -> tuple[str, list[str]]:
         - The full visible text content of the page.
         - A list of all absolute HTTP/HTTPS links found in <a> tags.
     """
-    logging.info(f"Starting scrape: {hostname}")
-    if not hostname.startswith('http'): # in case valid url entered (case scrape subpages or external sorces)
-        url = fix_url(hostname)
-        logging.debug(f"Fixed URL: {url}")
-    else:
-        url = hostname
+    logging.info(f"Starting scrape: {url}")
 
     try:
         with sync_playwright() as p:
-            browser = p.chromium.launch(headless=True)
+            browser = p.chromium.launch(headless=False)
             page = browser.new_page()
 
-            page.goto(url, wait_until="networkidle")
-            logging.info(f"Page loaded: {url}")
+            page.goto(url, wait_until="domcontentloaded")
+
+            final_url = page.url
+            logging.info(f"Final URL after redirect: {final_url}")
 
             # Get all hrefs from <a> tags
             hrefs = page.eval_on_selector_all("a", "els => els.map(el => el.href)")
-            links = [href for href in hrefs if href and href.startswith("http") and hostname in href]
+            domain = urlparse(final_url).netloc
+            links = [href for href in hrefs if href and href.startswith("http") and domain in href]
             logging.info(f"Found {len(links)} links")
 
             # Get all visible text content
@@ -297,10 +289,12 @@ def get_hostname_dict_data(hostname: str) -> dict:
         "hostname": hostname,
         "vendor_website_url": homepage_url, # fixed homepage url
         "is_ai": False,
+        "has_ai_probability": False,
         "description": "",
-        "system_name": "", # Product name
+        "system_name": tldextract.extract(homepage_url).domain.capitalize(), # Product name
         "vendor_name": "",  # Company name
         "favicon_url": "",
+        "rating": 5
     }
 
     web_text, _ = scrape_page(homepage_url)
@@ -324,6 +318,7 @@ def get_hostname_dict_data(hostname: str) -> dict:
         is_ai, system_name, vendor_name, description = get_page_info_from_gpt(web_text)
         result["is_ai"] = is_ai
         result['favicon_url'] = get_favicon_url(homepage_url)
+        result['has_ai_probability'] = True
         result['system_name'] = system_name
         result['vendor_name'] = vendor_name
         result['description'] = description
@@ -343,7 +338,8 @@ def get_hostname_dict_data(hostname: str) -> dict:
 
 
 def main():
-    input_file = "corona_pending_hostnames.json"
+    load_dotenv()
+    input_file = "test.json"
     output_file = "enriched_data.xlsx"
 
     if not os.path.exists(input_file):
@@ -353,7 +349,7 @@ def main():
     with open(input_file, "r", encoding="utf-8") as f:
         hostnames = json.load(f)
 
-    hostnames = [url for url in hostnames if url][:30]
+    hostnames = [url for url in hostnames if url][:10]
 
     results = []
     for i, hostname in enumerate(hostnames):
