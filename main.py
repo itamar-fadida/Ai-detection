@@ -11,32 +11,44 @@ from dotenv import load_dotenv
 from consts import AI_DICT_DETECTION, MIN_SCORE, SAAS_DICT_DETECTION
 
 
-def get_page_info_from_gpt(web_text: str, url: str) -> tuple[bool, str, str]:
+def get_page_info_from_gpt(web_text: str, url: str) -> tuple[bool, bool, str, str]:
     """
-    Use GPT to analyze scraped text and extract:
-    - is_ai
-    - vendor name (company)
-    - short description
-    Also confirm if it's actually a SaaS product (vs. blog/docs).
+    Use GPT to analyze web text and return:
+    - is_ai: Whether it's an AI SaaS product
+    - is_sure: Whether the model is confident
+    - vendor_name: If confident
+    - description: If confident
     """
     prompt = f"""
     You are an AI classifier. Based on the text below, answer:
-
-    1. Is this an AI SaaS product?
-    2. Who is the vendor?
-    3. What does the system do? Write description around 160 characters.
+    
+    1. Is this an AI SaaS product? ("is_ai": bool)
+    2. Are you confident in your answer? ("is_sure": bool)
+    
+    If and only if you are confident ("is_sure": true), also provide:
+    - "vendor_name": str
+    - "description": str (~160 characters)
     
     WEB URL: {url}
+    
     WEB TEXT:
     --
     {web_text}
     --
 
-    Respond in JSON:
+    
+    Respond in JSON. if not confident:
     {{
-      "is_ai": bool,
-      "vendor_name": "str",
-      "description": "str"
+      "is_ai": true,
+      "is_sure": false
+    }}
+    
+    if confident:
+    {{
+      "is_ai": true,
+      "is_sure": true,
+      "vendor_name": str,
+      "description": str
     }}
     """
 
@@ -56,13 +68,14 @@ def get_page_info_from_gpt(web_text: str, url: str) -> tuple[bool, str, str]:
 
         return (
             result.get("is_ai", False),
+            result.get("is_sure", False),
             result.get("vendor_name", ""),
             result.get("description", ""),
         )
 
     except Exception as e:
         print(f"Error getting GPT response: {e}")
-        return False, "", ""
+        return False, False, "", ""
 
 
 def get_page_info_from_perplexity(web_text: str, url: str) -> tuple[bool, str, str]:
@@ -289,7 +302,7 @@ def scrape_page(url: str) -> tuple[str, str, str, list[str]]:
             return web_text, urljoin(url, favicon_href), final_url, links
 
     except Exception as e:
-        logging.error(f"Failed to scrape {url}: {e}")
+        print(f"Failed to scrape {url}: {e}")
         return "", "", "", []
 
 
@@ -302,9 +315,10 @@ def get_hostname_dict_data(hostname: str) -> dict:
         "hostname": hostname,
         "vendor_website_url": homepage_url, # fixed homepage url
         "redirect_url": "",
-        "is_ai": False,
         "has_ai_probability": False,
         "has_saas_probability": False,
+        "is_ai": False,
+        "is_sure": "",
         "description": "",
         "system_name": get_system_name(hostname),
         "vendor_name": "",  # Company name
@@ -312,7 +326,7 @@ def get_hostname_dict_data(hostname: str) -> dict:
         "rating": 5
     }
 
-    web_text, favicon_url, redirect_url, _ = scrape_page(homepage_url)
+    web_text, favicon_url, redirect_url, _ = scrape_page(hostname)
 
     has_saas_probability = is_contain_saas_words(web_text)
     has_ai_probability = is_contain_ai_words(web_text, homepage_url)[0]
@@ -334,10 +348,17 @@ def get_hostname_dict_data(hostname: str) -> dict:
     result['has_saas_probability'] = has_saas_probability
 
     if has_ai_probability:
-        is_ai, vendor_name, description = get_page_info_from_gpt(web_text, homepage_url)
+        is_ai, is_sure, vendor_name, description = get_page_info_from_gpt(web_text, homepage_url)
+        if is_sure:
+            result["is_ai"] = is_ai
+            result["is_sure"] = is_sure
+            result['vendor_name'] = vendor_name
+            result['description'] = description
+            return result
+        is_ai, vendor_name, description = get_page_info_from_perplexity(homepage_url, homepage_url)
         result["is_ai"] = is_ai
-        result['vendor_name'] = vendor_name
-        result['description'] = description
+        result["vendor_name"] = vendor_name
+        result["description"] = description
         return result
 
     if has_saas_probability:
@@ -361,11 +382,11 @@ def main():
     with open(input_file, "r", encoding="utf-8") as f:
         hostnames = json.load(f)
 
-    hostnames = [url for url in hostnames if url]
+    hostnames = [url for url in hostnames if url][:10]
 
     results = []
     for i, hostname in enumerate(hostnames):
-        print(f"{i + 1}. Processing: {hostname}")
+        # print(f"{i + 1}. Processing: {hostname}")
         result = get_hostname_dict_data(hostname)
         results.append(result)
 
