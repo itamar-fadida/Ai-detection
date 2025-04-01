@@ -86,9 +86,3 @@ LOW_SAAS_WORDS = {
 SAAS_DICT_DETECTION = {word.lower(): HIGH_SCORE for word in HIGH_SAAS_WORDS}
 SAAS_DICT_DETECTION.update({word.lower(): MEDIUM_SCORE for word in MEDIUM_SAAS_WORDS})
 SAAS_DICT_DETECTION.update({word.lower(): LOW_SCORE for word in LOW_SAAS_WORDS})
-
-EXTERNAL_SOURCES = [
-    "https://www.linkedin.com/search/results/companies/?keywords={query}",
-    "https://en.wikipedia.org/wiki/{query}",
-    "https://twitter.com/search?q={query}&src=typed_query"
-]
