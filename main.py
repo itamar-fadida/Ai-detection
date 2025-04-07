@@ -78,6 +78,16 @@ def get_page_info_from_gpt(web_text: str, url: str) -> tuple[bool, bool, str, st
         return False, False, "", ""
 
 
+import re
+
+def extract_json_block(text: str) -> str:
+    """
+    Extract JSON from a string wrapped in a Markdown code block.
+    """
+    # Remove triple backticks and any optional "json" language marker
+    return re.sub(r"^```(?:json)?\s*|```$", "", text.strip(), flags=re.IGNORECASE | re.MULTILINE)
+
+
 def get_page_info_from_perplexity(web_text: str, url: str) -> tuple[bool, str, str]:
     """
     Use Perplexity's LLM-70 model to analyze scraped text and extract:
@@ -86,6 +96,8 @@ def get_page_info_from_perplexity(web_text: str, url: str) -> tuple[bool, str, s
     - short description
     Also confirm if it's actually a SaaS product (vs. blog/docs).
     """
+    MAX_TOKENS = 6000  # Perplexity's context window limit
+    truncated_text = web_text[:MAX_TOKENS]
     prompt = f"""
     You are an AI classifier. Based on the text below, answer:
     
@@ -96,7 +108,7 @@ def get_page_info_from_perplexity(web_text: str, url: str) -> tuple[bool, str, s
     WEB URL: {url}
     WEB TEXT:
     --
-    {web_text}
+    {truncated_text}
     --
     
     Respond in JSON:
@@ -113,21 +125,24 @@ def get_page_info_from_perplexity(web_text: str, url: str) -> tuple[bool, str, s
     }
 
     payload = {
-        "model": "llama-3-70b-instruct",
+        "model": "sonar",
         "messages": [{"role": "user", "content": prompt}],
-        "temperature": 0.4
+        "temperature": 0.4,
+        "max_tokens": 300
     }
 
     try:
         response = requests.post(
             "https://api.perplexity.ai/chat/completions",
             headers=headers,
-            json=payload
+            json=payload,
+            timeout=15
         )
         response.raise_for_status()
 
         content = response.json()["choices"][0]["message"]["content"]
-        result = json.loads(content)
+        cleaned = extract_json_block(content)
+        result = json.loads(cleaned)
 
         return (
             result.get("is_ai", False),
@@ -177,7 +192,7 @@ def is_contain_saas_words(web_text) -> bool:
         if word in text:
             score += SAAS_DICT_DETECTION[word]
         if score > MIN_SCORE:
-            print(f'saas ford has been found in main page: {word}')
+            # print(f'saas word has been found in main page: {word}')
             return True
     return False
 
@@ -318,7 +333,7 @@ def get_hostname_dict_data(hostname: str) -> dict:
         "has_ai_probability": False,
         "has_saas_probability": False,
         "is_ai": False,
-        "is_sure": "",
+        "is_sure": False,
         "description": "",
         "system_name": get_system_name(hostname),
         "vendor_name": "",  # Company name
@@ -326,7 +341,7 @@ def get_hostname_dict_data(hostname: str) -> dict:
         "rating": 5
     }
 
-    web_text, favicon_url, redirect_url, _ = scrape_page(hostname)
+    web_text, favicon_url, redirect_url, _ = scrape_page(homepage_url)
 
     has_saas_probability = is_contain_saas_words(web_text)
     has_ai_probability = is_contain_ai_words(web_text, homepage_url)[0]
@@ -355,14 +370,14 @@ def get_hostname_dict_data(hostname: str) -> dict:
             result['vendor_name'] = vendor_name
             result['description'] = description
             return result
-        is_ai, vendor_name, description = get_page_info_from_perplexity(homepage_url, homepage_url)
+        is_ai, vendor_name, description = get_page_info_from_perplexity(web_text, homepage_url)
         result["is_ai"] = is_ai
         result["vendor_name"] = vendor_name
         result["description"] = description
         return result
 
     if has_saas_probability:
-        is_ai, vendor_name, description = get_page_info_from_perplexity(homepage_url, homepage_url)
+        is_ai, vendor_name, description = get_page_info_from_perplexity(web_text, homepage_url)
         result["is_ai"] = is_ai
         result["vendor_name"] = vendor_name
         result["description"] = description
@@ -382,7 +397,7 @@ def main():
     with open(input_file, "r", encoding="utf-8") as f:
         hostnames = json.load(f)
 
-    hostnames = [url for url in hostnames if url][:10]
+    hostnames = [url for url in hostnames if url]
 
     results = []
     for i, hostname in enumerate(hostnames):
