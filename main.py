@@ -6,79 +6,10 @@ import pandas as pd
 import requests
 from playwright.sync_api import sync_playwright
 from urllib.parse import urlparse, urljoin
-import openai
 from dotenv import load_dotenv
 from consts import AI_DICT_DETECTION, MIN_SCORE, SAAS_DICT_DETECTION
-
-
-def get_page_info_from_gpt(web_text: str, url: str) -> tuple[bool, bool, str, str]:
-    """
-    Use GPT to analyze web text and return:
-    - is_ai: Whether it's an AI SaaS product
-    - is_sure: Whether the model is confident
-    - vendor_name: If confident
-    - description: If confident
-    """
-    prompt = f"""
-    You are an AI classifier. Based on the text below, answer:
-    
-    1. Is this an AI SaaS product? ("is_ai": bool)
-    2. Are you confident in your answer? ("is_sure": bool)
-    
-    If and only if you are confident ("is_sure": true), also provide:
-    - "vendor_name": str
-    - "description": str (~160 characters)
-    
-    WEB URL: {url}
-    
-    WEB TEXT:
-    --
-    {web_text}
-    --
-
-    
-    Respond in JSON. if not confident:
-    {{
-      "is_ai": true,
-      "is_sure": false
-    }}
-    
-    if confident:
-    {{
-      "is_ai": true,
-      "is_sure": true,
-      "vendor_name": str,
-      "description": str
-    }}
-    """
-
-    try:
-        client = openai.OpenAI()
-
-        response = client.chat.completions.create(
-            model="gpt-3.5-turbo",
-            messages=[
-                {"role": "user", "content": prompt}
-            ],
-            temperature=0.4,
-        )
-
-        content = response.choices[0].message.content.strip()
-        result = json.loads(content)
-
-        return (
-            result.get("is_ai", False),
-            result.get("is_sure", False),
-            result.get("vendor_name", ""),
-            result.get("description", ""),
-        )
-
-    except Exception as e:
-        print(f"Error getting GPT response: {e}")
-        return False, False, "", ""
-
-
 import re
+
 
 def extract_json_block(text: str) -> str:
     """
@@ -88,47 +19,17 @@ def extract_json_block(text: str) -> str:
     return re.sub(r"^```(?:json)?\s*|```$", "", text.strip(), flags=re.IGNORECASE | re.MULTILINE)
 
 
-def get_page_info_from_perplexity(web_text: str, url: str) -> tuple[bool, str, str]:
-    """
-    Use Perplexity's LLM-70 model to analyze scraped text and extract:
-    - is web use Ai
-    - vendor name (company)
-    - short description
-    Also confirm if it's actually a SaaS product (vs. blog/docs).
-    """
-    MAX_TOKENS = 6000  # Perplexity's context window limit
-    truncated_text = web_text[:MAX_TOKENS]
-    prompt = f"""
-    You are an AI classifier. Based on the text below, answer:
-    
-    1. Is this an AI SaaS product?
-    2. Who is the vendor?
-    3. What does the system do? Write description around 160 characters.
-    
-    WEB URL: {url}
-    WEB TEXT:
-    --
-    {truncated_text}
-    --
-    
-    Respond in JSON:
-    {{
-      "is_ai": bool,
-      "vendor_name": "str",
-      "description": "str"
-    }}
-    """
-
+def get_page_info_from_perplexity(prompt: str) -> dict:
     headers = {
         "Authorization": f"Bearer {os.getenv('PERPLEXITY_API_KEY')}",
         "Content-Type": "application/json"
     }
 
     payload = {
-        "model": "sonar",
+        "model": "sonar-pro",
         "messages": [{"role": "user", "content": prompt}],
         "temperature": 0.4,
-        "max_tokens": 300
+        "max_tokens": 400
     }
 
     try:
@@ -136,23 +37,25 @@ def get_page_info_from_perplexity(web_text: str, url: str) -> tuple[bool, str, s
             "https://api.perplexity.ai/chat/completions",
             headers=headers,
             json=payload,
-            timeout=15
+            timeout=20
         )
         response.raise_for_status()
 
         content = response.json()["choices"][0]["message"]["content"]
         cleaned = extract_json_block(content)
         result = json.loads(cleaned)
-
-        return (
-            result.get("is_ai", False),
-            result.get("vendor_name", ""),
-            result.get("description", ""),
-        )
+        return result
 
     except Exception as e:
         print(f"Error getting Perplexity response: {e}")
-        return False, "", ""
+        return {
+            "is_ai": False,
+            "vendor_name": "",
+            "description": "",
+            "vendor_website_url": "",
+            "system_name": "",
+            "favicon_url": ""
+        }
 
 
 def is_contain_ai_words(web_text: str, web_url: str) -> tuple[bool, int]:
@@ -185,8 +88,10 @@ def is_contain_ai_words(web_text: str, web_url: str) -> tuple[bool, int]:
     return False, 0
 
 
-def is_contain_saas_words(web_text) -> bool:
+def is_contain_saas_words(web_text: str, url: str) -> bool:
     score = 0
+    if '/signin' in url:  # google auth
+        return True
     text = web_text.lower().replace("-", "").replace("\n", " ")
     for word in SAAS_DICT_DETECTION:
         if word in text:
@@ -226,7 +131,7 @@ def get_all_sub_pages_data(root_url: str, max_pages: int = 30) -> list[dict]:
         if current_url in visited:  # should never get in but for extra safety...
             continue
 
-        web_text, _, _, links = scrape_page(current_url)
+        web_text, _, _, links, _ = scrape_page(current_url)
 
         visited.add(current_url)
 
@@ -259,23 +164,7 @@ def fix_url(hostname: str) -> str:
     return url
 
 
-extensions = {
-    "www", "ai", "com", "net", "org", "io", "app", "dev",
-    "co", "us", "uk", "ca", "info", "site", "tech", "web",
-    "online", "store", "cloud", "platform", "systems"
-}
-
-def get_system_name(hostname: str) -> str:
-    """
-    Extract a system name by removing common extensions like 'www', 'ai', 'com'.
-    E.g., 'bard.google.com' -> 'bard google'
-    """
-    parts = hostname.split('.')
-    words = [p for p in parts if p not in extensions]
-    return ' '.join(words)
-
-
-def scrape_page(url: str) -> tuple[str, str, str, list[str]]:
+def scrape_page(url: str) -> tuple[str, str, str, list[str], bool]:
     """
     Scrape the given URL using a headless browser.
 
@@ -289,7 +178,9 @@ def scrape_page(url: str) -> tuple[str, str, str, list[str]]:
             browser = p.chromium.launch(headless=False)
             page = browser.new_page()
 
-            page.goto(url, wait_until="domcontentloaded")
+            response = page.goto(url, wait_until="domcontentloaded")
+            if not response or response.status >= 400:
+                raise Exception(f"HTTP error {response.status if response else 'unknown'}")
 
             final_url = page.url
             logging.info(f"Final URL after redirect: {final_url}")
@@ -308,79 +199,111 @@ def scrape_page(url: str) -> tuple[str, str, str, list[str]]:
             hrefs = page.eval_on_selector_all("a", "els => els.map(el => el.href)")
             domain = urlparse(final_url).netloc
             links = [href for href in hrefs if href and href.startswith("http") and domain in href]
-            logging.info(f"Found {len(links)} links")
+            # print(f"Found {len(links)} links")
 
             # Get all visible text content
             web_text = page.evaluate("() => document.body.innerText")
 
             browser.close()
-            return web_text, urljoin(url, favicon_href), final_url, links
+            return web_text, urljoin(url, favicon_href), final_url, links, True
 
     except Exception as e:
         print(f"Failed to scrape {url}: {e}")
-        return "", "", "", []
+        return "", "", "", [], False
 
 
 def get_hostname_dict_data(hostname: str) -> dict:
-    """
-    """
     homepage_url = fix_url(hostname)
 
     result = {
         "hostname": hostname,
-        "vendor_website_url": homepage_url, # fixed homepage url
-        "redirect_url": "",
-        "has_ai_probability": False,
-        "has_saas_probability": False,
+        "hostname_url": homepage_url,
+        "is_valid_url": False,
+        "vendor_website_url": "",
         "is_ai": False,
-        "is_sure": False,
         "description": "",
-        "system_name": get_system_name(hostname),
+        "system_name": "",
         "vendor_name": "",  # Company name
         "favicon_url": "",
+        "has_ai_probability": False,
+        "has_saas_probability": False,
         "rating": 5
     }
 
-    web_text, favicon_url, redirect_url, _ = scrape_page(homepage_url)
+    web_text, favicon_url, redirect_url, _, is_valid = scrape_page(homepage_url)
+    result['is_valid_url'] = is_valid
 
-    has_saas_probability = is_contain_saas_words(web_text)
+    if not is_valid:
+        prompt = f"""
+        You are an AI classifier. The given website could not be scraped (possibly 404 or restricted).
+        Based only on the domain name, infer the following:
+
+        1. Is this an AI SaaS product?
+        2. Who is the vendor?
+        3. What is the system name? (2-3 words)
+        4. What does the system do? Write a short description (max 160 characters).
+        5. What is the likely homepage URL of the product or company?
+        6. What is the likely favicon URL?
+
+        DOMAIN: {hostname}
+
+        Respond in JSON:
+        {{
+          "is_ai": bool,
+          "vendor_name": "str",
+          "system_name": "str",
+          "description": "str",
+          "vendor_website_url": "str",
+          "favicon_url": "str"
+        }}
+        """
+        info = get_page_info_from_perplexity(prompt)
+
+        result["vendor_website_url"] = info["vendor_website_url"]
+        result["is_ai"] = info.get("is_ai", False)
+        result["vendor_name"] = info.get("vendor_name", "")
+        result["system_name"] = info.get("system_name")
+        result["description"] = info.get("description")
+        result["favicon_url"] = info.get("favicon_url")
+
+        return result
+
+    has_saas_probability = is_contain_saas_words(web_text, redirect_url)
     has_ai_probability = is_contain_ai_words(web_text, homepage_url)[0]
 
-    if not has_ai_probability:
-        sub_pages_data = get_all_sub_pages_data(homepage_url, 10)
-        if sub_pages_data:
-            has_ai_probability = True
-            about_page = next((p for p in sub_pages_data if "about" in p.get("url", "").lower()), None)
-            if about_page:
-                web_text = about_page.get("web_text", "")
-            else:
-                sub_pages_data.sort(key=lambda x: x.get("ai_score", 0), reverse=True)
-                web_text = sub_pages_data[0].get('web_text')  # gets the web with the highest Ai score and will ask for him in prompt
+    if not has_ai_probability and get_all_sub_pages_data(homepage_url, 10):  # has sub-pages with ai probability
+        has_ai_probability = True
 
     result['favicon_url'] = favicon_url
-    result['redirect_url'] = redirect_url
+    result['vendor_website_url'] = redirect_url
     result['has_ai_probability'] = has_ai_probability
     result['has_saas_probability'] = has_saas_probability
 
-    if has_ai_probability:
-        is_ai, is_sure, vendor_name, description = get_page_info_from_gpt(web_text, homepage_url)
-        if is_sure:
-            result["is_ai"] = is_ai
-            result["is_sure"] = is_sure
-            result['vendor_name'] = vendor_name
-            result['description'] = description
-            return result
-        is_ai, vendor_name, description = get_page_info_from_perplexity(web_text, homepage_url)
-        result["is_ai"] = is_ai
-        result["vendor_name"] = vendor_name
-        result["description"] = description
-        return result
+    if has_ai_probability or has_saas_probability:
+        prompt = f"""
+        You are an AI classifier. Check the web page at the URL below and answer:
 
-    if has_saas_probability:
-        is_ai, vendor_name, description = get_page_info_from_perplexity(web_text, homepage_url)
-        result["is_ai"] = is_ai
-        result["vendor_name"] = vendor_name
-        result["description"] = description
+        1. Is this an AI SaaS product?
+        2. Who is the vendor?
+        3. What is the system name? (2-3 words)
+        4. What does the system do? Write a short description (~160 characters).
+
+        WEB URL: {homepage_url}
+
+        Respond in JSON:
+        {{
+          "is_ai": bool,
+          "vendor_name": "str",
+          "system_name": "str",
+          "description": "str"
+        }}
+        """
+        info = get_page_info_from_perplexity(prompt)
+
+        result["is_ai"] = info.get("is_ai", False)
+        result["vendor_name"] = info.get("vendor_name", "")
+        result["system_name"] = info.get("system_name", "")
+        result["description"] = info.get("description", "")
 
     return result
 
@@ -388,7 +311,7 @@ def get_hostname_dict_data(hostname: str) -> dict:
 def main():
     load_dotenv()
     input_file = "test.json"
-    output_file = "enriched_data.xlsx"
+    output_file = "enriched_data_final.xlsx"
 
     if not os.path.exists(input_file):
         print(f"❌ File not found: {input_file}")
@@ -412,4 +335,4 @@ def main():
 
 
 if __name__ == "__main__":
-    main()  # can add async version if test lot of hostnames
+    main()
