@@ -1,10 +1,10 @@
 import json
-import logging
 import os
 from collections import deque
 import pandas as pd
-import requests
-from playwright.sync_api import sync_playwright
+from playwright.async_api import async_playwright
+import aiohttp
+import asyncio
 from urllib.parse import urlparse, urljoin
 from dotenv import load_dotenv
 from consts import AI_DICT_DETECTION, MIN_SCORE, SAAS_DICT_DETECTION
@@ -12,14 +12,13 @@ import re
 
 
 def extract_json_block(text: str) -> str:
-    """
-    Extract JSON from a string wrapped in a Markdown code block.
-    """
-    # Remove triple backticks and any optional "json" language marker
-    return re.sub(r"^```(?:json)?\s*|```$", "", text.strip(), flags=re.IGNORECASE | re.MULTILINE)
+    match = re.search(r'\{[\s\S]+?\}', text)
+    if match:
+        return match.group()
+    raise ValueError("No JSON object found")
 
 
-def get_page_info_from_perplexity(prompt: str) -> dict:
+async def get_page_info_from_perplexity(prompt: str) -> dict:
     headers = {
         "Authorization": f"Bearer {os.getenv('PERPLEXITY_API_KEY')}",
         "Content-Type": "application/json"
@@ -33,18 +32,18 @@ def get_page_info_from_perplexity(prompt: str) -> dict:
     }
 
     try:
-        response = requests.post(
-            "https://api.perplexity.ai/chat/completions",
-            headers=headers,
-            json=payload,
-            timeout=20
-        )
-        response.raise_for_status()
-
-        content = response.json()["choices"][0]["message"]["content"]
-        cleaned = extract_json_block(content)
-        result = json.loads(cleaned)
-        return result
+        async with aiohttp.ClientSession() as session:
+            async with session.post(
+                    "https://api.perplexity.ai/chat/completions",
+                    headers=headers,
+                    json=payload,
+                    timeout=aiohttp.ClientTimeout(total=20)
+            ) as response:
+                response.raise_for_status()
+                data = await response.json()
+                content = data["choices"][0]["message"]["content"]
+                cleaned = extract_json_block(content)
+                return json.loads(cleaned)
 
     except Exception as e:
         print(f"Error getting Perplexity response: {e}")
@@ -107,7 +106,7 @@ def is_same_domain(url: str, base: str) -> bool:
     return urlparse(url).netloc == urlparse(base).netloc
 
 
-def get_all_sub_pages_data(root_url: str, max_pages: int = 30) -> list[dict]:
+async def get_all_sub_pages_data(root_url: str, max_pages: int = 30) -> list[dict]:
     """
     Crawl subpages from a root URL (using BFS), collect text, and detect AI-related content.
 
@@ -131,7 +130,7 @@ def get_all_sub_pages_data(root_url: str, max_pages: int = 30) -> list[dict]:
         if current_url in visited:  # should never get in but for extra safety...
             continue
 
-        web_text, _, _, links, _ = scrape_page(current_url)
+        web_text, _, _, links, _ = await scrape_page(current_url)
 
         visited.add(current_url)
 
@@ -164,47 +163,35 @@ def fix_url(hostname: str) -> str:
     return url
 
 
-def scrape_page(url: str) -> tuple[str, str, str, list[str], bool]:
-    """
-    Scrape the given URL using a headless browser.
-
-    Returns:
-        - The full visible text content of the page.
-        - A list of all absolute HTTP/HTTPS links found in <a> tags.
-    """
-
+async def scrape_page(url: str) -> tuple[str, str, str, list[str], bool]:
     try:
-        with sync_playwright() as p:
-            browser = p.chromium.launch(headless=False)
-            page = browser.new_page()
+        async with async_playwright() as p:
+            # don't remove the headless tag - this opens the web in window and responsible for the redirect
+            browser = await p.chromium.launch(headless=False)
+            page = await browser.new_page()
 
-            response = page.goto(url, wait_until="domcontentloaded")
+            response = await page.goto(url, wait_until="domcontentloaded")
             if not response or response.status >= 400:
                 raise Exception(f"HTTP error {response.status if response else 'unknown'}")
 
             final_url = page.url
-            logging.info(f"Final URL after redirect: {final_url}")
-            favicon_href = page.evaluate("""
-                            () => {
-                                const rels = ["icon", "shortcut icon", "apple-touch-icon"];
-                                for (const rel of rels) {
-                                    const link = document.querySelector(`link[rel='${rel}']`);
-                                    if (link && link.href) return link.href;
-                                }
-                                return "/favicon.ico";  // fallback
-                            }
-                        """)
+            favicon_href = await page.evaluate("""
+                () => {
+                    const rels = ["icon", "shortcut icon", "apple-touch-icon"];
+                    for (const rel of rels) {
+                        const link = document.querySelector(`link[rel='${rel}']`);
+                        if (link && link.href) return link.href;
+                    }
+                    return "/favicon.ico";
+                }
+            """)
 
-            # Get all hrefs from <a> tags
-            hrefs = page.eval_on_selector_all("a", "els => els.map(el => el.href)")
+            hrefs = await page.eval_on_selector_all("a", "els => els.map(el => el.href)")
             domain = urlparse(final_url).netloc
             links = [href for href in hrefs if href and href.startswith("http") and domain in href]
-            # print(f"Found {len(links)} links")
+            web_text = await page.evaluate("() => document.body.innerText")
 
-            # Get all visible text content
-            web_text = page.evaluate("() => document.body.innerText")
-
-            browser.close()
+            await browser.close()
             return web_text, urljoin(url, favicon_href), final_url, links, True
 
     except Exception as e:
@@ -212,7 +199,7 @@ def scrape_page(url: str) -> tuple[str, str, str, list[str], bool]:
         return "", "", "", [], False
 
 
-def get_hostname_dict_data(hostname: str) -> dict:
+async def get_hostname_dict_data(hostname: str) -> dict:
     homepage_url = fix_url(hostname)
 
     result = {
@@ -230,7 +217,7 @@ def get_hostname_dict_data(hostname: str) -> dict:
         "rating": 5
     }
 
-    web_text, favicon_url, redirect_url, _, is_valid = scrape_page(homepage_url)
+    web_text, favicon_url, redirect_url, _, is_valid = await scrape_page(homepage_url)
     result['is_valid_url'] = is_valid
 
     if not is_valid:
@@ -247,7 +234,7 @@ def get_hostname_dict_data(hostname: str) -> dict:
 
         DOMAIN: {hostname}
 
-        Respond in JSON:
+        Respond ONLY with a valid JSON object inside a code block like this:
         {{
           "is_ai": bool,
           "vendor_name": "str",
@@ -257,7 +244,7 @@ def get_hostname_dict_data(hostname: str) -> dict:
           "favicon_url": "str"
         }}
         """
-        info = get_page_info_from_perplexity(prompt)
+        info = await get_page_info_from_perplexity(prompt)
 
         result["vendor_website_url"] = info["vendor_website_url"]
         result["is_ai"] = info.get("is_ai", False)
@@ -271,7 +258,7 @@ def get_hostname_dict_data(hostname: str) -> dict:
     has_saas_probability = is_contain_saas_words(web_text, redirect_url)
     has_ai_probability = is_contain_ai_words(web_text, homepage_url)[0]
 
-    if not has_ai_probability and get_all_sub_pages_data(homepage_url, 10):  # has sub-pages with ai probability
+    if not has_ai_probability and await get_all_sub_pages_data(homepage_url, 10):  # has sub-pages with ai probability
         has_ai_probability = True
 
     result['favicon_url'] = favicon_url
@@ -290,7 +277,7 @@ def get_hostname_dict_data(hostname: str) -> dict:
 
         WEB URL: {homepage_url}
 
-        Respond in JSON:
+        Respond ONLY with a valid JSON object inside a code block like this:
         {{
           "is_ai": bool,
           "vendor_name": "str",
@@ -298,7 +285,7 @@ def get_hostname_dict_data(hostname: str) -> dict:
           "description": "str"
         }}
         """
-        info = get_page_info_from_perplexity(prompt)
+        info = await get_page_info_from_perplexity(prompt)
 
         result["is_ai"] = info.get("is_ai", False)
         result["vendor_name"] = info.get("vendor_name", "")
@@ -308,10 +295,10 @@ def get_hostname_dict_data(hostname: str) -> dict:
     return result
 
 
-def main():
+async def main():
     load_dotenv()
     input_file = "test.json"
-    output_file = "enriched_data_final.xlsx"
+    output_file = "enriched_data.xlsx"
 
     if not os.path.exists(input_file):
         print(f"❌ File not found: {input_file}")
@@ -322,11 +309,14 @@ def main():
 
     hostnames = [url for url in hostnames if url]
 
-    results = []
-    for i, hostname in enumerate(hostnames):
-        # print(f"{i + 1}. Processing: {hostname}")
-        result = get_hostname_dict_data(hostname)
-        results.append(result)
+    sem = asyncio.Semaphore(scrape_parallel_amount)  # limit to 5 concurrent tasks
+
+    async def get_hostname_with_limit(hostname):
+        async with sem:
+            return await get_hostname_dict_data(hostname)
+
+    tasks = [get_hostname_with_limit(h) for h in hostnames][:2]
+    results = await asyncio.gather(*tasks)
 
     # Save to Excel (creates if not exists, overwrites if exists)
     enriched_df = pd.DataFrame(results)
@@ -335,4 +325,5 @@ def main():
 
 
 if __name__ == "__main__":
-    main()
+    scrape_parallel_amount = 15
+    asyncio.run(main())
