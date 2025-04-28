@@ -5,7 +5,7 @@ MEDIUM_SCORE = 5
 LOW_SCORE = 2
 
 HIGH_AI_WORDS = {
-    "ai", "ml", "intelligence", "deeplearning",
+    "ai", "a.i.", "a.i", "auto", "ml", "intelligence", "deeplearning",
     "artificialintelligence",
     "deeplearning", "neuralnetworks",
     "machinelearning",
@@ -74,13 +74,13 @@ AI_DICT_DETECTION.update({word.lower(): LOW_SCORE for word in LOW_AI_WORDS})
 
 HIGH_SAAS_WORDS = {
     "dashboard", "subscription", "cloud-based", "platform", "software as a service", "web app", "multi-tenant", "saas",
-    "login", "log in", "sign up", 'continue with google', 'continue with apple', 'continue with facebook',
+    "login", "log in", "sign up", "join", 'continue with google', 'continue with apple', 'continue with facebook',
     'continue with microsoft', 'continue with twitter', 'continue with x', 'continue with github',
     'continue with gitlab', 'continue with linkedin', 'continue with amazon', 'continue with microsoft 365',
     'continue with slack', 'continue with zoom', 'continue with atlassian', 'continue with bitbucket',
     'continue with stack overflow', 'continue with reddit', 'continue with dev.to', 'continue with yahoo',
     'continue with baidu', 'continue with wechat', 'continue with line', 'continue with naver', 'continue with vk',
-    'continue with kakao', 'continue with passkey', 'continue with web3 wallet', 'continue with metamask',
+    'continue with kakao', 'purchase', 'continue with passkey', 'continue with web3 wallet', 'continue with metamask',
     'continue with coinbase', 'continue with walletconnect', "pricing", "api", "register", "account", "demo",
     "online software", "free trial", "admin panel"
 }

@@ -96,7 +96,7 @@ def is_contain_saas_words(web_text: str, url: str) -> bool:
         if word in text:
             score += SAAS_DICT_DETECTION[word]
         if score > MIN_SCORE:
-            # print(f'saas word has been found in main page: {word}')
+            # print(f'SaaS word has been found in main page: {word}')
             return True
     return False
 
@@ -152,17 +152,6 @@ async def get_all_sub_pages_data(root_url: str, max_pages: int = 30) -> list[dic
     return results
 
 
-def fix_url(hostname: str) -> str:
-    """
-    Apply any necessary URL corrections before scraping.
-    Extend this function as needed.
-    """
-    url = f'https://{hostname}/'
-    url = url.replace('.net', '.com')
-    # Add more rules here if needed
-    return url
-
-
 async def scrape_page(url: str) -> tuple[str, str, str, list[str], bool]:
     try:
         async with async_playwright() as p:
@@ -200,7 +189,7 @@ async def scrape_page(url: str) -> tuple[str, str, str, list[str], bool]:
 
 
 async def get_hostname_dict_data(hostname: str) -> dict:
-    homepage_url = fix_url(hostname)
+    homepage_url = f'https://{hostname}/'
 
     result = {
         "hostname": hostname,
@@ -208,6 +197,7 @@ async def get_hostname_dict_data(hostname: str) -> dict:
         "is_valid_url": False,
         "vendor_website_url": "",
         "is_ai": False,
+        "is_pure_ai_saas": False,
         "description": "",
         "system_name": "",
         "vendor_name": "",  # Company name
@@ -225,13 +215,18 @@ async def get_hostname_dict_data(hostname: str) -> dict:
         You are an AI classifier. The given website could not be scraped (possibly 404 or restricted).
         Based only on the domain name, infer the following:
 
-        1. Is this an AI SaaS product?
-        2. Who is the vendor?
-        3. What is the system name? (2-3 words)
+        1. Is this an AI SaaS product? 
+        2. Who is the vendor? (1-3 words)
+        3. What is the system name? (1-3 words)
         4. What does the system do? Write a short description (max 160 characters).
         5. What is the likely homepage URL of the product or company?
         6. What is the likely favicon URL?
-
+        7. Is this a *pure* AI SaaS product where AI is the core offering?
+        
+        HARD RULE:
+        If your `description` includes terms like "AI", **"LLM", "machine learning", "generative", or any clear reference to artificial intelligence:
+        Then you MUST set `"is_ai": true`.
+        
         DOMAIN: {hostname}
 
         Respond ONLY with a valid JSON object inside a code block like this:
@@ -241,7 +236,8 @@ async def get_hostname_dict_data(hostname: str) -> dict:
           "system_name": "str",
           "description": "str",
           "vendor_website_url": "str",
-          "favicon_url": "str"
+          "favicon_url": "str",
+          "is_pure_ai_saas": bool
         }}
         """
         info = await get_page_info_from_perplexity(prompt)
@@ -252,13 +248,14 @@ async def get_hostname_dict_data(hostname: str) -> dict:
         result["system_name"] = info.get("system_name")
         result["description"] = info.get("description")
         result["favicon_url"] = info.get("favicon_url")
+        result["is_pure_ai_saas"] = info.get("is_pure_ai_saas", False)
 
         return result
 
     has_saas_probability = is_contain_saas_words(web_text, redirect_url)
     has_ai_probability = is_contain_ai_words(web_text, homepage_url)[0]
 
-    if not has_ai_probability and await get_all_sub_pages_data(homepage_url, 10):  # has sub-pages with ai probability
+    if not has_ai_probability and await get_all_sub_pages_data(homepage_url, 10):  # has sub-pages with Ai probability
         has_ai_probability = True
 
     result['favicon_url'] = favicon_url
@@ -266,14 +263,19 @@ async def get_hostname_dict_data(hostname: str) -> dict:
     result['has_ai_probability'] = has_ai_probability
     result['has_saas_probability'] = has_saas_probability
 
-    if has_ai_probability or has_saas_probability:
+    if not with_words_detection or (has_ai_probability or has_saas_probability):
         prompt = f"""
         You are an AI classifier. Check the web page at the URL below and answer:
 
         1. Is this an AI SaaS product?
-        2. Who is the vendor?
-        3. What is the system name? (2-3 words)
+        2. Who is the vendor? (1-3 words)
+        3. What is the system name? (1-3 words)
         4. What does the system do? Write a short description (~160 characters).
+        5. Is this a *pure* AI SaaS product where AI is the core offering?
+
+        HARD RULE:
+        If your `description` includes terms like "AI", **"LLM", "machine learning", "generative", or any clear reference to artificial intelligence:
+        Then you MUST set `"is_ai": true`.
 
         WEB URL: {homepage_url}
 
@@ -282,7 +284,8 @@ async def get_hostname_dict_data(hostname: str) -> dict:
           "is_ai": bool,
           "vendor_name": "str",
           "system_name": "str",
-          "description": "str"
+          "description": "str",
+          "is_pure_ai_saas": bool
         }}
         """
         info = await get_page_info_from_perplexity(prompt)
@@ -291,6 +294,7 @@ async def get_hostname_dict_data(hostname: str) -> dict:
         result["vendor_name"] = info.get("vendor_name", "")
         result["system_name"] = info.get("system_name", "")
         result["description"] = info.get("description", "")
+        result["is_pure_ai_saas"] = info.get("is_pure_ai_saas", False)
 
     return result
 
@@ -298,7 +302,7 @@ async def get_hostname_dict_data(hostname: str) -> dict:
 async def main():
     load_dotenv()
     input_file = "test.json"
-    output_file = "enriched_data.xlsx"
+    output_file = "more.xlsx"
 
     if not os.path.exists(input_file):
         print(f"❌ File not found: {input_file}")
@@ -308,14 +312,13 @@ async def main():
         hostnames = json.load(f)
 
     hostnames = [url for url in hostnames if url]
-
     sem = asyncio.Semaphore(scrape_parallel_amount)  # limit to 5 concurrent tasks
 
     async def get_hostname_with_limit(hostname):
         async with sem:
             return await get_hostname_dict_data(hostname)
 
-    tasks = [get_hostname_with_limit(h) for h in hostnames][:2]
+    tasks = [get_hostname_with_limit(h) for h in hostnames]
     results = await asyncio.gather(*tasks)
 
     # Save to Excel (creates if not exists, overwrites if exists)
@@ -325,5 +328,22 @@ async def main():
 
 
 if __name__ == "__main__":
+    with_words_detection = False
     scrape_parallel_amount = 15
     asyncio.run(main())
+
+
+tags = [
+  "Generative AI", "Text Generation", "Image Generation", "Video Generation",
+  "Chatbot", "Conversational AI", "Creative Tools", "Content Creation",
+  "Advertising", "Marketing", "Sales", "CRM", "Automation", "Workflow Automation",
+  "No-code", "Low-code", "Web Development", "Website Builder", "Design Tools",
+  "Analytics", "Data Intelligence", "Open Source", "NLP", "Transformers",
+  "Productivity", "Assistant", "Enterprise AI"
+]
+
+verticals = [
+  "Marketing", "Sales", "Finance", "Healthcare", "Education",
+  "Developer Tools", "Automation", "Design & Creative", "Analytics",
+  "Web & CMS", "General", "Legal", "HR & Recruiting", "Productivity"
+]
