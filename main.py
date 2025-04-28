@@ -32,7 +32,7 @@ def extract_json_block(text: str) -> str:
     raise ValueError("No JSON object found")
 
 
-def get_page_info_from_perplexity(prompt: str) -> dict:
+async def get_page_info_from_perplexity(prompt: str) -> dict:
     headers = {
         "Authorization": f"Bearer {os.getenv('PERPLEXITY_API_KEY')}",
         "Content-Type": "application/json"
@@ -46,16 +46,18 @@ def get_page_info_from_perplexity(prompt: str) -> dict:
     }
 
     try:
-        response = requests.post(
-            "https://api.perplexity.ai/chat/completions",
-            headers=headers,
-            json=payload,
-            timeout=20
-        )
-        response.raise_for_status()
-        content = response.json()["choices"][0]["message"]["content"]
-        cleaned = extract_json_block(content)
-        return json.loads(cleaned)
+        async with aiohttp.ClientSession() as session:
+            async with session.post(
+                    "https://api.perplexity.ai/chat/completions",
+                    headers=headers,
+                    json=payload,
+                    timeout=aiohttp.ClientTimeout(total=20)
+            ) as response:
+                response.raise_for_status()
+                data = await response.json()
+                content = data["choices"][0]["message"]["content"]
+                cleaned = extract_json_block(content)
+                return json.loads(cleaned)
 
     except Exception as e:
         print(f"Error getting Perplexity response: {e}")
@@ -73,19 +75,19 @@ def get_page_info_from_perplexity(prompt: str) -> dict:
         }
 
 
-def scrape_page(url: str) -> tuple[str, str, bool]:
+async def scrape_page(url: str) -> tuple[str, str, str, list[str], bool]:
     try:
-        with sync_playwright() as p:
+        async with async_playwright() as p:
             # don't remove the headless tag - this opens the web in window and responsible for the redirect
-            browser = p.chromium.launch(headless=False)
-            page = browser.new_page()
+            browser = await p.chromium.launch(headless=False)
+            page = await browser.new_page()
 
-            response = page.goto(url, wait_until="domcontentloaded")
+            response = await page.goto(url, wait_until="domcontentloaded")
             if not response or response.status >= 400:
                 raise Exception(f"HTTP error {response.status if response else 'unknown'}")
 
             final_url = page.url
-            favicon_href = page.evaluate("""
+            favicon_href = await page.evaluate("""
                 () => {
                     const rels = ["icon", "shortcut icon", "apple-touch-icon"];
                     for (const rel of rels) {
@@ -96,19 +98,25 @@ def scrape_page(url: str) -> tuple[str, str, bool]:
                 }
             """)
 
-            browser.close()
-            return urljoin(url, favicon_href), final_url, True
+            hrefs = await page.eval_on_selector_all("a", "els => els.map(el => el.href)")
+            domain = urlparse(final_url).netloc
+            links = [href for href in hrefs if href and href.startswith("http") and domain in href]
+            web_text = await page.evaluate("() => document.body.innerText")
+
+            await browser.close()
+            return web_text, urljoin(url, favicon_href), final_url, links, True
 
     except Exception as e:
         print(f"Failed to scrape {url}: {e}")
         return "", "", False
 
 
-def enrich_hostname(hostname: str) -> dict:
+async def get_hostname_dict_data(hostname: str) -> dict:
     load_dotenv()
     homepage_url = f'https://{hostname.strip()}'
 
-    result = {
+
+result = {
         "hostname": hostname,
         "hostname_url": homepage_url,
         "is_valid_url": False,
@@ -125,7 +133,7 @@ def enrich_hostname(hostname: str) -> dict:
         "rating": 5
     }
 
-    favicon_url, redirect_url, is_valid = scrape_page(homepage_url)
+    favicon_url, redirect_url, is_valid = await scrape_page(homepage_url)
     result['is_valid_url'] = is_valid
 
     if not is_valid:
@@ -172,7 +180,7 @@ def enrich_hostname(hostname: str) -> dict:
           "risk": "str"
         }}
         """
-        info = get_page_info_from_perplexity(prompt)
+        info = await get_page_info_from_perplexity(prompt)
 
         result["vendor_website_url"] = info.get("vendor_website_url")
         result["is_ai"] = info.get("is_ai", False)
@@ -245,9 +253,35 @@ def enrich_hostname(hostname: str) -> dict:
     return result
 
 
-def main(hostname):
-    return enrich_hostname(hostname)
+async def main():
+    load_dotenv()
+    input_file = "test.json"
+    output_file = "more.xlsx"
+
+    if not os.path.exists(input_file):
+        print(f"❌ File not found: {input_file}")
+        return
+
+    with open(input_file, "r", encoding="utf-8") as f:
+        hostnames = json.load(f)
+
+    hostnames = [url for url in hostnames if url]
+    sem = asyncio.Semaphore(scrape_parallel_amount)  # limit to 5 concurrent tasks
+
+    async def get_hostname_with_limit(hostname):
+        async with sem:
+            return await get_hostname_dict_data(hostname)
+
+    tasks = [get_hostname_with_limit(h) for h in hostnames]
+    results = await asyncio.gather(*tasks)
+
+    # Save to Excel (creates if not exists, overwrites if exists)
+    enriched_df = pd.DataFrame(results)
+    enriched_df.to_excel(output_file, index=False)
+    print(f"✅ Saved: {output_file}")
 
 
 if __name__ == "__main__":
-    main('deepseek.com')
+    with_words_detection = False
+    scrape_parallel_amount = 15
+    asyncio.run(main())
