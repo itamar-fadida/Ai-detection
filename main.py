@@ -1,28 +1,30 @@
-import json
 import os
-import requests
-from playwright.sync_api import sync_playwright
-from urllib.parse import urljoin
-from dotenv import load_dotenv
+import json
+import asyncio
 import re
+from urllib.parse import urljoin
+import aiohttp
+from dotenv import load_dotenv
+from playwright.async_api import async_playwright
+import openai
 
+load_dotenv()
 
-TAGS_BANK = [
-    "Generative AI", "Text Generation", "Image Generation", "Video Generation",
-    "Chatbot", "Conversational AI", "Creative Tools", "Content Creation",
-    "Advertising", "Marketing", "Sales", "CRM", "Automation", "Workflow Automation",
-    "No-code", "Low-code", "Web Development", "Website Builder", "Design Tools",
-    "Analytics", "Data Intelligence", "Open Source", "NLP", "Transformers",
-    "Productivity", "Assistant", "Enterprise AI"
-]
+OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
 
-VERTICALS_BANK = [
-    "Marketing", "Sales", "Finance", "Healthcare", "Education",
-    "Developer Tools", "Automation", "Design & Creative", "Analytics",
-    "Web & CMS", "General", "Legal", "HR & Recruiting", "Productivity"
-]
+PERPLEXITY_API_KEY = os.getenv("PERPLEXITY_API_KEY")
 
-RISK_BANK = ['Low', 'Medium', 'High', 'Critical']
+TAGS = ['Conversational AI', 'Search Augmented', 'Coding Assistant', 'Office Productivity', 'Customer Support',
+        'Creative Writing', 'Translation', 'Grammar & Rewriting', 'Note Taking', 'Personal Companion', 'Multimodal AI',
+        'Image Generation', 'Video Generation', 'Voice Assistant', 'Education & Tutoring', 'Search Engine',
+        'On-Device AI', 'Data Analysis', 'Security & Compliance', 'Agent / Automation']
+
+VERTICALS = ['General Productivity', 'Software Development', 'Marketing & Advertising', 'Customer Service',
+             'Education & Training', 'Legal', 'Healthcare & Life Sciences', 'Finance & Accounting', 'Human Resources',
+             'Media & Entertainment', 'Retail & eCommerce', 'Security & Risk', 'Government & Public Sector',
+             'Energy & Utilities', 'Real Estate', 'Transportation & Logistics', 'Manufacturing', 'Scientific Research',
+             'Design & UX', 'Recruiting & Talent']
+
 
 
 def extract_json_block(text: str) -> str:
@@ -32,7 +34,9 @@ def extract_json_block(text: str) -> str:
     raise ValueError("No JSON object found")
 
 
-async def get_page_info_from_perplexity(prompt: str) -> dict:
+async def get_page_info_from_perplexity(system_name: str, ask_for_favicon=False) -> dict:
+    prompt = build_favicon_prompt(system_name) if ask_for_favicon else build_prompt(system_name)
+
     headers = {
         "Authorization": f"Bearer {os.getenv('PERPLEXITY_API_KEY')}",
         "Content-Type": "application/json"
@@ -42,7 +46,7 @@ async def get_page_info_from_perplexity(prompt: str) -> dict:
         "model": "sonar-pro",
         "messages": [{"role": "user", "content": prompt}],
         "temperature": 0.4,
-        "max_tokens": 900
+        "max_tokens": 1000
     }
 
     try:
@@ -61,28 +65,64 @@ async def get_page_info_from_perplexity(prompt: str) -> dict:
 
     except Exception as e:
         print(f"Error getting Perplexity response: {e}")
-        return {
-            "is_ai": False,
-            "vendor_name": "",
-            "description": "",
-            "vendor_website_url": "",
-            "system_name": "",
-            "favicon_url": "",
-            "is_pure_ai_saas": False,
-            "tags": [],
-            "verticals": [],
-            "risk": "Low"
-        }
+        return {}
 
 
-async def scrape_page(url: str) -> tuple[str, str, str, list[str], bool]:
+def build_favicon_prompt(system_url: str) -> str:
+    return f"""
+Given the website URL "{system_url}", return a JSON object with a single field:
+- favicon_url: A fully-qualified direct link to the site's main favicon.
+
+Respond with only a valid JSON object. Example format:
+
+{{
+  "favicon_url": "..."
+}}
+"""
+
+
+def build_prompt(system_name):
+    return f"""
+Given the system name "{system_name}", return a JSON object with the following fields:
+
+- name: The product or system name.
+- vendor: The company or organization behind it.
+- description: A short description (max 160 characters).
+- rating: Integer from 1 to 5 based on trustworthiness, maturity, and usage.
+- url: Main homepage or product page.
+- tags: Choose only from this fixed list: {TAGS}.
+- risk: One of "low", "medium", "high".
+- vertical: Choose only from this list: {VERTICALS}.
+- hostname_regex: Regex to match the domain (e.g., "^chatgpt\\.com$").
+- ai_type: One of: "pure_ai", "ai_integrated", or "infra_api".
+
+Respond with only a JSON object.
+"""
+
+async def query_openai(system_name: str, client: openai.AsyncOpenAI) -> dict:
+    try:
+        prompt = build_prompt(system_name)
+        response = await client.chat.completions.create(
+            model="gpt-4",
+            messages=[{"role": "user", "content": prompt}],
+            temperature=0.2
+        )
+        text = response.choices[0].message.content
+        json_obj = re.search(r"\{.*\}", text, re.DOTALL)
+        return json.loads(json_obj.group(0)) if json_obj else {}
+    except Exception as e:
+        print(f"❌ OpenAI error for {system_name}: {e}")
+        return {}
+
+
+async def scrape_favicon(url: str) -> str:
+    browser = None
     try:
         async with async_playwright() as p:
-            # don't remove the headless tag - this opens the web in window and responsible for the redirect
             browser = await p.chromium.launch(headless=False)
             page = await browser.new_page()
-
             response = await page.goto(url, wait_until="domcontentloaded")
+
             if not response or response.status >= 400:
                 raise Exception(f"HTTP error {response.status if response else 'unknown'}")
 
@@ -97,191 +137,69 @@ async def scrape_page(url: str) -> tuple[str, str, str, list[str], bool]:
                     return "/favicon.ico";
                 }
             """)
-
-            hrefs = await page.eval_on_selector_all("a", "els => els.map(el => el.href)")
-            domain = urlparse(final_url).netloc
-            links = [href for href in hrefs if href and href.startswith("http") and domain in href]
-            web_text = await page.evaluate("() => document.body.innerText")
-
             await browser.close()
-            return web_text, urljoin(url, favicon_href), final_url, links, True
-
+            return urljoin(final_url, favicon_href)
     except Exception as e:
-        print(f"Failed to scrape {url}: {e}")
-        return "", "", False
+        if browser:
+            await browser.close()
+        print(f"⚠️ Favicon scrape failed for {url}: {e}")
+        return ""
 
 
-async def get_hostname_dict_data(hostname: str) -> dict:
-    load_dotenv()
-    homepage_url = f'https://{hostname.strip()}'
+def is_incomplete(ai_info: dict) -> bool:
+    if not ai_info:
+        return True
+    return (
+        ai_info.get("vendor", "").lower() == "unknown"
+        or "unspecified" in ai_info.get("description", "").lower()
+        or not ai_info.get("url")
+        or not ai_info.get("name")
+    )
 
 
-result = {
-        "hostname": hostname,
-        "hostname_url": homepage_url,
-        "is_valid_url": False,
-        "vendor_website_url": "",
-        "is_ai": False,
-        "is_pure_ai_saas": False,
-        "description": "",
-        "system_name": "",
-        "vendor_name": "",
-        "favicon_url": "",
-        "tags": [],
-        "verticals": [],
-        "risk": "Low",
-        "rating": 5
-    }
+async def enrich_system(system_name: str, client: openai.AsyncOpenAI) -> dict:
+    print(f"🔍 Processing: {system_name}")
+    ai_info = await query_openai(system_name, client)
 
-    favicon_url, redirect_url, is_valid = await scrape_page(homepage_url)
-    result['is_valid_url'] = is_valid
+    if is_incomplete(ai_info):
+        print(f"⚠️ Incomplete info from OpenAI for {system_name}, retrying via Perplexity...")
+        ai_info = await get_page_info_from_perplexity(system_name, ask_for_favicon=False)
 
-    if not is_valid:
-        prompt = f"""
-        You are an AI classifier. The given website could not be scraped (possibly 404 or restricted).
-        Based only on the domain name, infer the following:
+    if not ai_info or not ai_info.get("url"):
+        print(f"❌ Skipping {system_name}, still incomplete after fallback.")
+        return {}
 
-        1. Is this an AI SaaS product? 
-        2. Who is the vendor? (1-3 words)
-        3. What is the system name? (1-3 words)
-        4. What does the system do? Write a short description (max 160 characters).
-        5. What is the likely homepage URL of the product or company?
-        6. What is the likely favicon URL?
-        7. Is this a *pure* AI SaaS product where AI is the core offering?
-        8. Select the 2–5 most relevant Tags that best describe the system. Choose ONLY from this list: {TAGS_BANK}.
-        9. Select the 1–5 most appropriate Verticals that represent the primary industries or sectors the system serves. Choose ONLY from this list: {VERTICALS_BANK}.
-        10. Assign a Risk Level from {RISK_BANK}, based on the following strict evaluation:
-        - AI Model Type: If the system is a large language model (LLM), generative AI, or autonomous agent, the minimum risk level is "High".
-        - Data Sensitivity: If the system handles personal, financial, healthcare, or confidential data without strong compliance signals, assign "High" or "Critical" risk.
-        - Autonomy: Systems that can make decisions without human review should be rated "High" or "Critical" risk.
-        - Vendor Trustworthiness: If the vendor is unknown, unverified, or based outside the U.S. or Europe (e.g., China, Russia), assign "Critical" risk unless strong compliance evidence (e.g., GDPR, SOC2) is shown.
+    favicon_url = await scrape_favicon(ai_info["url"])
+    if not favicon_url and not ai_info.get("favicon_url"):
+        print(f"⚠️ Favicon missing, asking Perplexity...")
+        perplexity_info = await get_page_info_from_perplexity(system_name, ask_for_favicon=True)
+        ai_info["favicon_url"] = perplexity_info.get("favicon_url", "")
+
+    ai_info["favicon_url"] = favicon_url
+    print(f"✅ Done: {system_name}")
+    return ai_info
 
 
-        
-        HARD RULES:
-        - NEVER return empty Tags or Verticals: choose at least 2 Tags and 1 Vertical.
-        - If your `description` includes terms like "AI", "LLM", "machine learning", "generative", or any clear reference to artificial intelligence:
-          Then you MUST set `"is_ai": true`.
-        - ONLY choose Tags and Verticals from the provided lists.
-        
-        DOMAIN: {hostname}
+async def main(input_path: str, output_path: str):
+    with open(input_path, "r", encoding="utf-8") as f:
+        system_names = [line.strip() for line in f if line.strip()]
 
-        Respond ONLY with a valid JSON object inside a code block like this:
-        {{
-          "is_ai": bool,
-          "vendor_name": "str",
-          "system_name": "str",
-          "description": "str",
-          "vendor_website_url": "str",
-          "favicon_url": "str",
-          "is_pure_ai_saas": bool,
-          "tags": [ "str", ... ],
-          "verticals": [ "str", ... ],
-          "risk": "str"
-        }}
-        """
-        info = await get_page_info_from_perplexity(prompt)
+    client = openai.AsyncOpenAI(api_key=OPENAI_API_KEY)
+    semaphore = asyncio.Semaphore(5)
 
-        result["vendor_website_url"] = info.get("vendor_website_url")
-        result["is_ai"] = info.get("is_ai", False)
-        result["vendor_name"] = info.get("vendor_name", "")
-        result["system_name"] = info.get("system_name")
-        result["description"] = info.get("description")
-        result["favicon_url"] = info.get("favicon_url")
-        result["is_pure_ai_saas"] = info.get("is_pure_ai_saas", False)
-        result["tags"] = info.get("tags", [])
-        result["verticals"] = info.get("verticals", [])
-        result["risk"] = info.get("risk", "Low")
+    async def limited_enrich_system(system_name, client):
+        async with semaphore:
+            return await enrich_system(system_name, client)
 
-        print(json.dumps(result, indent=2))
-        return result
+    tasks = [limited_enrich_system(name, client) for name in system_names]
+    all_results = await asyncio.gather(*tasks)
+    results = [r for r in all_results if r]
 
-    # for case could scrape the web and got the favicon url
-    result['favicon_url'] = favicon_url
-    result['vendor_website_url'] = redirect_url
+    with open(output_path, "w", encoding="utf-8") as f:
+        json.dump(results, f, indent=2, ensure_ascii=False)
 
-    prompt = f"""
-    You are an AI classifier. Check the web page at the URL below and answer:
-
-    1. Is this an AI SaaS product?
-    2. Who is the vendor? (1-3 words)
-    3. What is the system name? (1-3 words)
-    4. What does the system do? Write a short description (~160 characters).
-    5. Is this a *pure* AI SaaS product where AI is the core offering?
-    6. Select the 2–5 most relevant Tags that best describe the system. Choose ONLY from this list: {TAGS_BANK}.
-    7. Select the 1–5 most appropriate Verticals that represent the primary industries or sectors the system serves. Choose ONLY from this list: {VERTICALS_BANK}.
-    8. . Assign a Risk Level from {RISK_BANK}, based on the following strict evaluation:
-        - AI Model Type: If the system is a large language model (LLM), generative AI, or autonomous agent, the minimum risk level is "High".
-        - Data Sensitivity: If the system handles personal, financial, healthcare, or confidential data without strong compliance signals, assign "High" or "Critical" risk.
-        - Autonomy: Systems that can make decisions without human review should be rated "High" or "Critical" risk.
-        - Vendor Trustworthiness: If the vendor is unknown, unverified, or based outside the U.S. or Europe (e.g., China, Russia), assign "Critical" risk unless strong compliance evidence (e.g., GDPR, SOC2) is shown.
-
-
-        
-    HARD RULES:
-    - NEVER return empty Tags or Verticals: choose at least 2 Tags and 1 Vertical.
-    - If your `description` includes terms like "AI", "LLM", "machine learning", "generative", or any clear reference to artificial intelligence:
-      Then you MUST set `"is_ai": true`.
-    - ONLY choose Tags and Verticals from the provided lists.
-    
-    WEB URL: {homepage_url}
-
-    Respond ONLY with a valid JSON object inside a code block like this:
-    {{
-      "is_ai": bool,
-      "vendor_name": "str",
-      "system_name": "str",
-      "description": "str",
-      "is_pure_ai_saas": bool,
-      "tags": [ "str", ... ],
-      "verticals": [ "str", ... ],
-      "risk": "str"
-    }}
-    """
-    info = get_page_info_from_perplexity(prompt)
-
-    result["is_ai"] = info.get("is_ai", False)
-    result["vendor_name"] = info.get("vendor_name", "")
-    result["system_name"] = info.get("system_name", "")
-    result["description"] = info.get("description", "")
-    result["is_pure_ai_saas"] = info.get("is_pure_ai_saas", False)
-    result["tags"] = info.get("tags", [])
-    result["verticals"] = info.get("verticals", [])
-    result["risk"] = info.get("risk", "Low")
-
-    print(json.dumps(result, indent=2))
-    return result
-
-
-async def main():
-    load_dotenv()
-    input_file = "test.json"
-    output_file = "more.xlsx"
-
-    if not os.path.exists(input_file):
-        print(f"❌ File not found: {input_file}")
-        return
-
-    with open(input_file, "r", encoding="utf-8") as f:
-        hostnames = json.load(f)
-
-    hostnames = [url for url in hostnames if url]
-    sem = asyncio.Semaphore(scrape_parallel_amount)  # limit to 5 concurrent tasks
-
-    async def get_hostname_with_limit(hostname):
-        async with sem:
-            return await get_hostname_dict_data(hostname)
-
-    tasks = [get_hostname_with_limit(h) for h in hostnames]
-    results = await asyncio.gather(*tasks)
-
-    # Save to Excel (creates if not exists, overwrites if exists)
-    enriched_df = pd.DataFrame(results)
-    enriched_df.to_excel(output_file, index=False)
-    print(f"✅ Saved: {output_file}")
+    print(f"\n✅ Saved {len(results)} systems to {output_path}")
 
 
 if __name__ == "__main__":
-    with_words_detection = False
-    scrape_parallel_amount = 15
-    asyncio.run(main())
+    asyncio.run(main("ai_systems.txt", "ai_systems.json"))
